@@ -6,6 +6,10 @@
 
 ## Usage:
 
+- Datasets
+  - [Automated Lesion Segmentation in PET/CT Challenge](https://autopet-ii.grand-challenge.org/dataset/)
+  - [MICCAI Hecktor 2022 Challenge](https://hecktor.grand-challenge.org/Data/)
+
 - Train
 ```
 python -u train.py
