@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# CodeGraph local index
+.codegraph/
+
+# Experiment artifacts
+save/
+checkpoints/
+logs/
+runs/
+results/
+result/
+result_metrics/
+inference_metrics.csv
+*.pth
+*.pt
+*.ckpt
+events.out.tfevents.*
+
+# Local medical imaging data and predictions
+datasets/
+data/
+*.nii
+*.nii.gz

@@ -1,126 +1,129 @@
-import torchio as tio
-from pathlib import Path
-import torch
+"""Segmentation metrics used by the H2ASeg training and inference scripts."""
+
+from __future__ import annotations
+
+from typing import Sequence
+
 import numpy as np
-import copy
-from medpy.metric.binary import hd,hd95
+import torch
 
-def show_deep_metrics(outputs, labels, deep=True):
-    s = ''
-    end = 0 if not deep else len(outputs) - 1
-    res = []
-    for i, output in enumerate(outputs):
-        if (not deep) & (i > 0):
-            break
-        if i == end:
-            s = '\n'
-        output = output.argmax(dim=1, keepdim=True)
-        fp, fn, iou, dice = metrics_tensor(labels, output)
-        print("[FP:{:.4f}, FN:{:.4f}, IoU:{:.4f}, Dice:{:.4f} pix:{:6}/{:6}]{}".format(fp, fn, iou, dice, 
-                                                                                       output.sum(), labels.sum(), s))
-        if i == 0:
-            res += [fp, fn, iou, dice]
-    return res
 
-def get_hausdorff(gt, pred):
-    if (gt.max() == 0) or (pred.max() == 0):
-        return np.NaN
-    else:
-        hausdorff_distance95 = hd95(pred.detach().cpu().numpy(), gt.detach().cpu().numpy())
-        return float(hausdorff_distance95)
+SMOOTH = 1e-3
+
+
+def _foreground_channel(array):
+    """Select the foreground channel from a two-channel mask."""
+    if array.ndim < 2:
+        raise ValueError(f"Expected a batched channel-first mask, got shape {array.shape}")
+    return array[:, 1:] if array.shape[1] == 2 else array
+
+
+def _validate_shapes(gt, pred) -> None:
+    if gt.shape != pred.shape:
+        raise ValueError(f"Ground truth and prediction shapes differ: {gt.shape} != {pred.shape}")
+
+
+def show_deep_metrics(
+    outputs: Sequence[torch.Tensor], labels: torch.Tensor, deep: bool = True
+):
+    """Print metrics for deep-supervision outputs and return the first output's metrics."""
+    selected_outputs = outputs if deep else outputs[:1]
+    first_metrics = None
+    for index, output in enumerate(selected_outputs):
+        prediction = output.argmax(dim=1, keepdim=True)
+        result = metrics_tensor(labels, prediction)
+        suffix = "\n" if index == len(selected_outputs) - 1 else ""
+        print(
+            "[FP:{:.4f}, FN:{:.4f}, IoU:{:.4f}, Dice:{:.4f} "
+            "pix:{:6}/{:6}]{}".format(
+                *result,
+                int(prediction.sum().item()),
+                int(labels.sum().item()),
+                suffix,
+            )
+        )
+        if first_metrics is None:
+            first_metrics = list(result)
+    if first_metrics is None:
+        raise ValueError("outputs must contain at least one prediction tensor")
+    return first_metrics
+
+
+def get_hausdorff(gt, pred) -> float:
+    """Return HD95, or NaN when either binary mask is empty.
+
+    MedPy is imported lazily so Dice/IoU evaluation does not require it.
+    """
+    gt_array = gt.detach().cpu().numpy() if torch.is_tensor(gt) else np.asarray(gt)
+    pred_array = pred.detach().cpu().numpy() if torch.is_tensor(pred) else np.asarray(pred)
+    if not np.any(gt_array) or not np.any(pred_array):
+        return float("nan")
+
+    from medpy.metric.binary import hd95
+
+    return float(hd95(pred_array, gt_array))
 
 
 def metrics(gt, pred):
-    assert (len(gt.shape) == len(pred.shape)) 
-    if pred.shape[1] == 2:
-        pred = pred[:, 1:]
+    """Compute false-positive rate, false-negative rate, IoU and Dice with NumPy."""
+    gt_array = _foreground_channel(np.asarray(gt)).astype(bool, copy=False)
+    pred_array = _foreground_channel(np.asarray(pred)).astype(bool, copy=False)
+    _validate_shapes(gt_array, pred_array)
 
-    if gt.shape[1] == 2:
-        gt = gt[:, 1:]
-    
-    pred = pred.astype(int)
-    gt = gt.astype(int)
-    fp_array = copy.deepcopy(pred)
-    fn_array = copy.deepcopy(gt)
-    gt_sum = gt.sum()
-    pred_sum = pred.sum()
-    
-    intersection = gt & pred
-    union = gt | pred
-    intersection_sum = intersection.sum()
-    union_sum = union.sum()
-    
-    tp_array = intersection
-    
-    diff = pred - gt
-    fp_array[diff < 1] = 0
-    
-    diff = gt - pred
-    fn_array[diff < 1] = 0
-    
-    tn_array = np.ones_like(gt) - union
-    
-    tp, fp, fn, tn = np.sum(tp_array), np.sum(fp_array), np.sum(fn_array), np.sum(tn_array)
-    
-    smooth = 0.001
-    precision = tp / (pred_sum + smooth)
-    recall = tp / (gt_sum + smooth)
-    
-    false_positive_rate = fp / (fp + tn + smooth)
-    false_negtive_rate = fn / (fn + tp + smooth)
+    intersection = np.logical_and(gt_array, pred_array)
+    union = np.logical_or(gt_array, pred_array)
+    false_positive = np.logical_and(pred_array, np.logical_not(gt_array)).sum()
+    false_negative = np.logical_and(gt_array, np.logical_not(pred_array)).sum()
+    true_positive = intersection.sum()
+    true_negative = np.logical_not(union).sum()
+    gt_sum = gt_array.sum()
+    pred_sum = pred_array.sum()
 
-    jaccard = intersection_sum / (union_sum + smooth)
-    dice = 2 * intersection_sum / (gt_sum + pred_sum + smooth)
-    
-    return float(false_positive_rate), float(false_negtive_rate), float(jaccard), float(dice)
+    false_positive_rate = false_positive / (false_positive + true_negative + SMOOTH)
+    false_negative_rate = false_negative / (false_negative + true_positive + SMOOTH)
+    jaccard = true_positive / (union.sum() + SMOOTH)
+    dice = 2 * true_positive / (gt_sum + pred_sum + SMOOTH)
+
+    return tuple(
+        float(value)
+        for value in (false_positive_rate, false_negative_rate, jaccard, dice)
+    )
 
 
-def metrics_tensor(gt, pred):
-    # b = pred.shape[0]
-    # res = [metrics_tensor_one_patience(gt[i:i+1], pred[i:i+1]) for i in range(b)]
-    # return np.mean(res, axis=0)
-    return metrics_tensor_one_patience(gt, pred)
+def metrics_tensor(gt: torch.Tensor, pred: torch.Tensor):
+    """Compute metrics without moving tensors away from their current device."""
+    return metrics_tensor_one_patient(gt, pred)
 
-def metrics_tensor_one_patience(gt, pred):
-    assert (len(gt.shape) == len(pred.shape)) 
-    if pred.shape[1] == 2:
-        pred = pred[:, 1:]
 
-    if gt.shape[1] == 2:
-        gt = gt[:, 1:]
-    
-    pred = pred.type(torch.IntTensor)
-    gt = gt.type(torch.IntTensor)
-    fp_array = copy.deepcopy(pred)
-    fn_array = copy.deepcopy(gt)
-    gt_sum = torch.sum(gt)
-    pred_sum = torch.sum(pred)
-    
-    intersection = gt & pred
-    union = gt | pred
-    intersection_sum = intersection.sum()
-    union_sum = union.sum()
-    
-    tp_array = intersection
-    
-    diff = pred - gt
-    fp_array[diff < 1] = 0
-    
-    diff = gt - pred
-    fn_array[diff < 1] = 0
-    
-    tn_array = torch.ones_like(gt) - union
-    
-    tp, fp, fn, tn = torch.sum(tp_array), torch.sum(fp_array), torch.sum(fn_array), torch.sum(tn_array)
-    
-    smooth = 0.001
-    precision = tp / (pred_sum + smooth)
-    recall = tp / (gt_sum + smooth)
-    
-    false_positive_rate = fp / (fp + tn + smooth)
-    false_negtive_rate = fn / (fn + tp + smooth)
+def metrics_tensor_one_patient(gt: torch.Tensor, pred: torch.Tensor):
+    """Tensor implementation of :func:`metrics` for one batch or patient."""
+    if gt.device != pred.device:
+        raise ValueError(f"Ground truth and prediction devices differ: {gt.device} != {pred.device}")
 
-    jaccard = intersection_sum / (union_sum + smooth)
-    dice = 2 * intersection_sum / (gt_sum + pred_sum + smooth)
-    
-    return float(false_positive_rate), float(false_negtive_rate), float(jaccard), float(dice)
+    gt_mask = _foreground_channel(gt).bool()
+    pred_mask = _foreground_channel(pred).bool()
+    _validate_shapes(gt_mask, pred_mask)
+
+    intersection = torch.logical_and(gt_mask, pred_mask)
+    union = torch.logical_or(gt_mask, pred_mask)
+    false_positive = torch.logical_and(pred_mask, torch.logical_not(gt_mask)).sum()
+    false_negative = torch.logical_and(gt_mask, torch.logical_not(pred_mask)).sum()
+    true_positive = intersection.sum()
+    true_negative = torch.logical_not(union).sum()
+    gt_sum = gt_mask.sum()
+    pred_sum = pred_mask.sum()
+
+    false_positive_rate = false_positive / (false_positive + true_negative + SMOOTH)
+    false_negative_rate = false_negative / (false_negative + true_positive + SMOOTH)
+    jaccard = true_positive / (union.sum() + SMOOTH)
+    dice = 2 * true_positive / (gt_sum + pred_sum + SMOOTH)
+
+    return tuple(
+        float(value.item())
+        for value in (false_positive_rate, false_negative_rate, jaccard, dice)
+    )
+
+
+def metrics_tensor_one_patience(gt: torch.Tensor, pred: torch.Tensor):
+    """Backward-compatible alias for the historical misspelled function name."""
+    return metrics_tensor_one_patient(gt, pred)
