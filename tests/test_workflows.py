@@ -51,7 +51,7 @@ def test_training_transforms_pad_patches_and_keep_validation_deterministic():
     assert not any(name.startswith("Rand") for name in validation_names)
 
 
-def test_checkpoint_loaders_accept_legacy_full_and_prefixed_formats(tmp_path):
+def test_checkpoint_loaders_accept_legacy_weights_and_reject_partial_training_state(tmp_path):
     source = torch.nn.Linear(2, 1)
     expected = {key: value.detach().clone() for key, value in source.state_dict().items()}
 
@@ -63,7 +63,14 @@ def test_checkpoint_loaders_accept_legacy_full_and_prefixed_formats(tmp_path):
 
     full_path = tmp_path / "full.ckpt"
     torch.save({"model_state_dict": expected, "epoch": 4}, full_path)
-    metadata = train.load_checkpoint(full_path, target, torch.device("cpu"))
+    with pytest.raises(ValueError, match="partial training metadata"):
+        train.load_checkpoint(full_path, target, torch.device("cpu"))
+    metadata = train.load_checkpoint(
+        full_path,
+        target,
+        torch.device("cpu"),
+        resume_mode="weights-only",
+    )
     assert metadata == {}
 
     prefixed_path = tmp_path / "prefixed.pth"

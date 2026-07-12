@@ -10,7 +10,7 @@ class IRC3(nn.Module):
         super(IRC3, self).__init__()
         
         self.conv = nn.Sequential(
-                nn.InstanceNorm3d(feat_out),
+                nn.InstanceNorm3d(feat_in),
                 nn.PReLU(),
                 nn.Conv3d(feat_in, feat_out, 3, 1, 1, bias=conv_bias),
                 )
@@ -26,7 +26,7 @@ class IRC1(nn.Module):
         super(IRC1, self).__init__()
         
         self.conv = nn.Sequential(
-                nn.InstanceNorm3d(feat_out),
+                nn.InstanceNorm3d(feat_in),
                 nn.PReLU(),
                 nn.Conv3d(feat_in, feat_out, 1, 1, 0, bias=conv_bias),
                 )

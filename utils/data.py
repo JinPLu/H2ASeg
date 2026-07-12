@@ -9,6 +9,7 @@ MetaTensor objects.
 from __future__ import annotations
 
 import csv
+from difflib import SequenceMatcher
 import random
 import re
 from pathlib import Path
@@ -19,6 +20,7 @@ import numpy as np
 
 NIFTI_SUFFIXES = (".nii.gz", ".nii")
 VALID_SPLITS = frozenset({"train", "val", "test"})
+_MANIFEST_FIELDS = frozenset({"case", "ct", "pet", "label", "split", "group"})
 
 _MODALITY_PATTERNS = {
     "ct": (r"(?:__|[_-])CT$", r"_0001$"),
@@ -51,6 +53,41 @@ def case_id(path: Path, modality: str) -> str:
         if updated != name:
             return updated
     return name
+
+
+def _validate_case_identifier(case: str, *, context: str) -> None:
+    """Require an output-safe, single-component case identifier."""
+    unsafe = (
+        not case
+        or case in {".", ".."}
+        or "/" in case
+        or "\\" in case
+        or any(ord(character) < 32 or ord(character) == 127 for character in case)
+    )
+    if unsafe:
+        raise ValueError(
+            f"{context} has unsafe case ID {case!r}; use a non-empty single "
+            "filename component without path separators or control characters"
+        )
+
+
+def _split_like_fields(fields: Sequence[str]) -> list[str]:
+    suspicious: list[str] = []
+    for field in fields:
+        if field in _MANIFEST_FIELDS:
+            continue
+        normalized = re.sub(r"[^a-z0-9]", "", field.casefold())
+        if not normalized:
+            continue
+        similarity = SequenceMatcher(None, normalized, "split").ratio()
+        if (
+            normalized == "split"
+            or normalized.startswith("split")
+            or normalized.endswith("split")
+            or similarity >= 0.75
+        ):
+            suspicious.append(field)
+    return sorted(suspicious)
 
 
 def _has_modality_suffix(path: Path, modality: str) -> bool:
@@ -87,6 +124,7 @@ def _index_directory(
         display_id = case_id(path, modality)
         if not display_id:
             raise ValueError(f"Empty case ID derived from {modality.upper()} file: {path}")
+        _validate_case_identifier(display_id, context=f"{modality.upper()} file {path}")
         key = display_id.casefold()
         if key in indexed:
             raise ValueError(
@@ -172,10 +210,11 @@ def _resolve_manifest_path(value: str, manifest: Path, field: str, case: str) ->
 
 
 def read_manifest(manifest: Path, require_labels: bool = False) -> list[dict[str, str]]:
-    """Read a canonical ``case,ct,pet[,label,split]`` CSV manifest.
+    """Read a canonical ``case,ct,pet[,label,split,group]`` CSV manifest.
 
     Relative image paths are resolved against the manifest's directory.  If
-    either ``label`` or ``split`` is used, it must be populated for every row.
+    ``label`` is used, or a ``split``/``group`` header is present, that field
+    must be populated for every row.
     """
     manifest = manifest.expanduser().resolve()
     if not manifest.is_file():
@@ -187,12 +226,20 @@ def read_manifest(manifest: Path, require_labels: bool = False) -> list[dict[str
         missing_fields = sorted(required - fields)
         if missing_fields:
             raise ValueError(f"Manifest is missing required columns: {', '.join(missing_fields)}")
+        suspicious_fields = _split_like_fields(tuple(fields))
+        if suspicious_fields:
+            raise ValueError(
+                "Manifest has an unrecognized split-like column "
+                f"{', '.join(repr(field) for field in suspicious_fields)}; "
+                "use the exact 'split' header"
+            )
         rows = list(reader)
     if not rows:
         raise ValueError(f"Manifest contains no cases: {manifest}")
 
     label_used = "label" in fields and any((row.get("label") or "").strip() for row in rows)
-    split_used = "split" in fields and any((row.get("split") or "").strip() for row in rows)
+    split_used = "split" in fields
+    group_used = "group" in fields
     if require_labels and not label_used:
         raise ValueError("Training/evaluation requires a populated manifest 'label' column")
 
@@ -204,6 +251,7 @@ def read_manifest(manifest: Path, require_labels: bool = False) -> list[dict[str
         case = (row.get("case") or "").strip()
         if not case:
             raise ValueError(f"Manifest line {line_number} has an empty case ID")
+        _validate_case_identifier(case, context=f"Manifest line {line_number}")
         normalized_case = case.casefold()
         if normalized_case in seen_cases:
             raise ValueError(
@@ -252,12 +300,25 @@ def read_manifest(manifest: Path, require_labels: bool = False) -> list[dict[str
             record["label"] = str(path)
         if split_used:
             split = (row.get("split") or "").strip().casefold()
+            if not split:
+                raise ValueError(
+                    f"Manifest line {line_number} has an empty 'split' value; "
+                    "the column must be populated for every case"
+                )
             if split not in VALID_SPLITS:
                 raise ValueError(
                     f"Manifest case {case!r} has invalid split {split!r}; "
                     f"expected one of {sorted(VALID_SPLITS)}"
                 )
             record["split"] = split
+        if group_used:
+            group = (row.get("group") or "").strip()
+            if not group:
+                raise ValueError(
+                    f"Manifest line {line_number} has an empty 'group' value; "
+                    "the column must be populated for every case"
+                )
+            record["group"] = group
         records.append(record)
     return records
 
@@ -297,19 +358,57 @@ def split_cases(
     if not cases:
         raise ValueError("Cannot split an empty dataset")
     copied = [dict(case) for case in cases]
+    for case in copied:
+        case_name = case.get("case")
+        if not isinstance(case_name, str):
+            raise ValueError("Every dataset record must have a string case ID")
+        _validate_case_identifier(case_name, context="Dataset record")
+
     split_flags = ["split" in case for case in copied]
+    group_flags = ["group" in case for case in copied]
+    if any(group_flags) and not all(group_flags):
+        raise ValueError("Group must be specified for every case or for none")
     if any(split_flags):
         if not all(split_flags):
             raise ValueError("Split must be specified for every case or for none")
         partitions = {name: [] for name in VALID_SPLITS}
+        group_splits: dict[str, tuple[str, str]] = {}
         for case in copied:
             split = case["split"].casefold()
             if split not in VALID_SPLITS:
                 raise ValueError(f"Case {case.get('case')!r} has invalid split {split!r}")
+            if group_flags[0]:
+                group = case["group"].strip()
+                if not group:
+                    raise ValueError(f"Case {case.get('case')!r} has an empty group ID")
+                normalized_group = group.casefold()
+                previous = group_splits.get(normalized_group)
+                if previous is not None and previous[0] != split:
+                    raise ValueError(
+                        f"Dataset group {previous[1]!r} is assigned to multiple splits "
+                        f"({previous[0]!r} and {split!r})"
+                    )
+                group_splits[normalized_group] = (split, group)
             partitions[split].append(case)
         if not partitions["train"] or not partitions["val"]:
             raise ValueError("Explicit splits must contain at least one train and one val case")
         return partitions["train"], partitions["val"], partitions["test"]
+
+    if group_flags[0]:
+        group_counts: dict[str, tuple[str, int]] = {}
+        for case in copied:
+            group = case["group"].strip()
+            if not group:
+                raise ValueError(f"Case {case.get('case')!r} has an empty group ID")
+            normalized_group = group.casefold()
+            display, count = group_counts.get(normalized_group, (group, 0))
+            group_counts[normalized_group] = (display, count + 1)
+        repeated = sorted(display for display, count in group_counts.values() if count > 1)
+        if repeated:
+            raise ValueError(
+                "Repeated group IDs require explicit manifest splits to prevent "
+                f"data leakage: {repeated}"
+            )
 
     ordered = sorted(copied, key=lambda case: case["case"].casefold())
     if mode == "seeded":
@@ -327,16 +426,90 @@ def split_cases(
     return train, val, test
 
 
-def foreground_above_minimum(values: Any) -> Any:
-    """Picklable foreground predicate matching H2ASeg's historical PET crop."""
-    return values > values.min()
-
-
 def _spatial_shape(value: Any) -> tuple[int, ...]:
     shape = tuple(int(item) for item in value.shape)
     if len(shape) < 3:
         raise ValueError(f"Expected at least 3 spatial dimensions, got shape {shape}")
-    return shape[-3:]
+    spatial_shape = shape[-3:]
+    if any(dimension <= 0 for dimension in spatial_shape):
+        raise ValueError(f"Expected positive spatial dimensions, got shape {shape}")
+    return spatial_shape
+
+
+def _array_data(value: Any) -> np.ndarray | None:
+    """Return numeric storage when *value* exposes an array/tensor protocol."""
+    converted = value
+    has_array_storage = isinstance(value, np.ndarray) or hasattr(value, "__array__")
+    if hasattr(converted, "detach"):
+        converted = converted.detach()
+        has_array_storage = True
+    if hasattr(converted, "cpu"):
+        converted = converted.cpu()
+    if hasattr(converted, "numpy"):
+        try:
+            return np.asarray(converted.numpy())
+        except (TypeError, ValueError):
+            pass
+    if has_array_storage:
+        try:
+            return np.asarray(converted)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def foreground_above_minimum(values: Any) -> Any:
+    """Picklable PET foreground predicate with fail-fast content checks."""
+    array = _array_data(values)
+    if array is None:
+        raise ValueError("PET crop values must expose numeric array data")
+    if array.size == 0:
+        raise ValueError("PET crop values are empty")
+    if array.dtype.kind not in "buif" or not np.isfinite(array).all():
+        raise ValueError("PET crop values contain non-finite or non-real values")
+    if not np.any(array > np.min(array)):
+        raise ValueError("PET crop values are constant; foreground would be empty")
+    return values > values.min()
+
+
+def _spatial_mask(mask: np.ndarray) -> np.ndarray:
+    leading_axes = tuple(range(mask.ndim - 3))
+    return np.any(mask, axis=leading_axes) if leading_axes else mask
+
+
+def _mask_bounds(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    lower: list[int] = []
+    upper: list[int] = []
+    for axis in range(mask.ndim):
+        other_axes = tuple(index for index in range(mask.ndim) if index != axis)
+        occupied = np.flatnonzero(np.any(mask, axis=other_axes))
+        lower.append(int(occupied[0]))
+        upper.append(int(occupied[-1]) + 1)
+    return np.asarray(lower), np.asarray(upper)
+
+
+def _validate_pet_crop_contains_label(
+    arrays: Mapping[str, np.ndarray], *, case: str
+) -> None:
+    pet = arrays.get("pet")
+    label = arrays.get("label")
+    if pet is None or label is None:
+        return
+    pet_mask = _spatial_mask(pet > np.min(pet))
+    label_mask = _spatial_mask(label != 0)
+    if not np.any(label_mask):
+        return
+
+    lower, upper = _mask_bounds(pet_mask)
+    crop = tuple(slice(int(start), int(stop)) for start, stop in zip(lower, upper))
+    total = int(np.count_nonzero(label_mask))
+    retained = int(np.count_nonzero(label_mask[crop]))
+    discarded = total - retained
+    if discarded:
+        raise ValueError(
+            f"Invalid training crop for case {case!r}: PET foreground bbox would "
+            f"discard {discarded} of {total} nonzero label voxels"
+        )
 
 
 def _affine(data: Mapping[str, Any], key: str) -> np.ndarray:
@@ -364,10 +537,11 @@ def validate_geometry(
     keys: Sequence[str],
     reference_key: str,
     case_key: str = "case",
+    validate_pet_crop: bool = False,
     affine_atol: float = 1e-4,
     affine_rtol: float = 1e-5,
 ) -> None:
-    """Fail if loaded modalities do not share shape and voxel-to-world affine."""
+    """Fail on unsafe image content/geometry and optional PET training crops."""
     if reference_key not in keys:
         raise ValueError("reference_key must be included in keys")
     missing = [key for key in keys if key not in data]
@@ -400,9 +574,40 @@ def validate_geometry(
                 f"{reference_key} (max absolute difference={max_difference:.6g})"
             )
 
+    arrays: dict[str, np.ndarray] = {}
+    for key in keys:
+        array = _array_data(data[key])
+        if array is None:
+            continue
+        expected_shape = tuple(int(item) for item in data[key].shape)
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"Invalid volume for case {case!r}: {key} exposes array shape "
+                f"{array.shape}, expected {expected_shape}"
+            )
+        if array.dtype.kind not in "buif":
+            raise ValueError(
+                f"Invalid volume for case {case!r}: {key} must have a real "
+                f"numeric dtype, got {array.dtype}"
+            )
+        if not np.isfinite(array).all():
+            raise ValueError(
+                f"Invalid volume for case {case!r}: {key} contains non-finite values"
+            )
+        arrays[key] = array
+
+    if validate_pet_crop:
+        pet = arrays.get("pet")
+        if pet is not None and not np.any(pet > np.min(pet)):
+            raise ValueError(
+                f"Invalid volume for case {case!r}: PET is constant; its foreground "
+                "crop would be empty"
+            )
+        _validate_pet_crop_contains_label(arrays, case=case)
+
 
 class ValidateGeometryd:
-    """MONAI-compatible dictionary transform that validates spatial alignment."""
+    """MONAI-compatible content/geometry validator with opt-in crop checks."""
 
     def __init__(
         self,
@@ -410,12 +615,14 @@ class ValidateGeometryd:
         reference_key: str,
         *,
         case_key: str = "case",
+        validate_pet_crop: bool = False,
         affine_atol: float = 1e-4,
         affine_rtol: float = 1e-5,
     ) -> None:
         self.keys = tuple(keys)
         self.reference_key = reference_key
         self.case_key = case_key
+        self.validate_pet_crop = validate_pet_crop
         self.affine_atol = affine_atol
         self.affine_rtol = affine_rtol
 
@@ -426,6 +633,7 @@ class ValidateGeometryd:
             keys=self.keys,
             reference_key=self.reference_key,
             case_key=self.case_key,
+            validate_pet_crop=self.validate_pet_crop,
             affine_atol=self.affine_atol,
             affine_rtol=self.affine_rtol,
         )

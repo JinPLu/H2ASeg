@@ -80,13 +80,13 @@ Missing, extra, duplicate, or ambiguous modalities fail with a case-level error.
 A manifest avoids filename inference and can also define an official dataset split:
 
 ```csv
-case,ct,pet,label,split
-CASE001,data/ct/CASE001.nii.gz,data/pet/CASE001.nii.gz,data/labels/CASE001.nii.gz,train
-CASE002,data/ct/CASE002.nii.gz,data/pet/CASE002.nii.gz,data/labels/CASE002.nii.gz,val
-CASE003,data/ct/CASE003.nii.gz,data/pet/CASE003.nii.gz,data/labels/CASE003.nii.gz,test
+case,ct,pet,label,split,group
+CASE001,data/ct/CASE001.nii.gz,data/pet/CASE001.nii.gz,data/labels/CASE001.nii.gz,train,PATIENT001
+CASE002,data/ct/CASE002.nii.gz,data/pet/CASE002.nii.gz,data/labels/CASE002.nii.gz,val,PATIENT002
+CASE003,data/ct/CASE003.nii.gz,data/pet/CASE003.nii.gz,data/labels/CASE003.nii.gz,test,PATIENT003
 ```
 
-Required columns are `case`, `ct`, and `pet`. `label` is required for training and optional for inference. `split`, when present, must be populated on every row with `train`, `val`, or `test`. Relative paths are resolved from the manifest directory. Use either `--manifest` or directory arguments, not both.
+Required columns are `case`, `ct`, and `pet`. `label` is required for training and optional for inference. `split` and `group`, when present, must be populated on every row. A group may not cross partitions; repeated group IDs require explicit splits so repeated visits cannot be divided case-by-case. Case IDs must be safe single filename components. Relative paths are resolved from the manifest directory. Use either `--manifest` or directory arguments, not both.
 
 ### Geometry contract
 
@@ -128,9 +128,9 @@ python train.py \
 
 `--amp` is active only on CUDA. Run `python train.py --help` for the complete, version-matched command-line interface.
 
-A legacy raw or wrapped state dictionary restores model weights only. The maintained `last.ckpt` additionally restores the optimizer, scheduler, AMP scaler, epoch/iteration counters, and available Python, NumPy, PyTorch, CUDA, and DataLoader-generator RNG state. It also records the parsed CLI configuration, model configuration, resolved cases, and resolved split.
+A legacy raw or wrapped state dictionary restores model weights only. Use `--resume-mode weights-only` when intentionally discarding training state from a wrapped checkpoint; incomplete training checkpoints otherwise fail instead of silently restarting. A maintained `last.ckpt` restores the optimizer, scheduler, matching AMP mode, epoch/iteration counters, and Python, NumPy, PyTorch, CUDA, DataLoader-generator, and (for `num_workers=0`) transform RNG state. Full resume also checks trajectory-affecting CLI values and the resolved split. Checkpoints are written by atomic replacement.
 
-Training crops PET foreground before random patch sampling to retain the historical sampling behavior. Validation does not crop: it performs deterministic sliding-window inference over the full input volume, matching standalone inference's spatial evaluation domain.
+Training crops PET foreground before random patch sampling to retain the historical sampling behavior. Non-finite volumes, constant PET inputs, and PET bounding boxes that would discard label foreground fail before sampling. Validation does not crop: it performs deterministic sliding-window inference over the full input volume, matching standalone inference's spatial evaluation domain. Full validation volumes and stitched logits remain on CPU; only windows are sent to the model device.
 
 ## Inference and evaluation
 
@@ -146,7 +146,7 @@ python inference.py \
   --device auto
 ```
 
-In directory mode, add `--label-dir dataset/labelsTr` to report false-positive rate, false-negative rate, IoU, Dice, and spacing-aware HD95. In manifest mode, a populated `label` column enables the same evaluation; omit that column for label-free inference. Saved masks reuse the reference CT affine and header.
+In directory mode, add `--label-dir dataset/labelsTr` to report false-positive rate, false-negative rate, precision, recall, IoU, Dice, and spacing-aware HD95. In manifest mode, a populated `label` column enables the same evaluation; omit that column for label-free inference. Saved masks reuse the reference CT affine and header, and output paths are checked against every source image before inference starts.
 
 Inference processes every row in the supplied manifest; the optional `split` column controls training partitions but does not filter inference. Provide a test-only manifest when evaluating only a held-out partition.
 
@@ -172,19 +172,20 @@ Run the complete suite in an environment containing the runtime and development 
 
 ```bash
 python -m pytest -q
+python scripts/verify_runtime.py --device auto --amp auto
 python train.py --help
 python inference.py --help
-python -m compileall -q train.py inference.py model utils tests
+python -m compileall -q train.py inference.py model utils scripts tests
 ```
 
-The tests cover case discovery, manifests and split behavior, geometry fail-fast checks, model-configuration constraints, metrics edge cases, checkpoint compatibility, deterministic transforms, and NIfTI export. CUDA-specific checks are skipped when CUDA is unavailable; a skip is not evidence that GPU execution passed.
+The tests cover case discovery, manifests and split behavior, geometry fail-fast checks, model-configuration constraints, metrics edge cases, checkpoint compatibility, deterministic transforms, and NIfTI export. `tests/test_runtime_contracts.py` deliberately fails collection when the core ML runtime is missing; it must not produce a false-green suite. The runtime verifier exercises a real five-head CE+Dice backward pass, checkpoint restoration, and production sliding-window inference. The strict runtime contracts also fail when CUDA is unavailable, because a CPU-only pass is not evidence that GPU/AMP execution works.
 
 ## Reproducibility notes
 
 - No intensity normalization is applied by the maintained training or inference entry points. Supply consistently preprocessed images.
 - The historical scripts provide evidence about an earlier AutoPET-II/HECKTOR preparation workflow, but contain hard-coded private paths and a consequential PET masking inconsistency. They should not be run blindly. See [docs/preprocessing.md](docs/preprocessing.md).
 - Random rotations are specified in radians (45 degrees by default) and labels use nearest-neighbor interpolation.
-- Dice and IoU follow the repository's binary metric convention, including the documented empty-mask behavior in `utils/metrics.py`.
+- Dice and IoU treat empty-ground-truth/empty-prediction as a correct match and exactly one empty mask as zero overlap. Paper-style validation excludes empty-ground-truth cases from overlap-based model selection and reports their false positives separately.
 - Checkpoints, TensorBoard logs, NIfTI data, and generated predictions are ignored by Git to reduce accidental publication of large or sensitive artifacts.
 
 ## Clinical-use boundary

@@ -130,6 +130,64 @@ def test_manifest_rejects_partial_optional_columns_and_mixed_inputs(tmp_path):
         discover_cases(tmp_path, tmp_path, manifest=manifest)
 
 
+def test_manifest_requires_every_split_value_when_column_is_present(tmp_path):
+    for name in ("A_CT.nii.gz", "A_PT.nii.gz"):
+        _touch(tmp_path / name)
+    manifest = tmp_path / "dataset.csv"
+    manifest.write_text(
+        "case,ct,pet,split\n"
+        "A,A_CT.nii.gz,A_PT.nii.gz,\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="empty 'split' value"):
+        read_manifest(manifest)
+
+
+def test_manifest_rejects_split_like_typo_and_unsafe_case_id(tmp_path):
+    for name in ("A_CT.nii.gz", "A_PT.nii.gz"):
+        _touch(tmp_path / name)
+    manifest = tmp_path / "dataset.csv"
+    manifest.write_text(
+        "case,ct,pet,splti\n"
+        "A,A_CT.nii.gz,A_PT.nii.gz,train\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="split-like column.*splti"):
+        read_manifest(manifest)
+
+    manifest.write_text(
+        "case,ct,pet\n"
+        "../escape,A_CT.nii.gz,A_PT.nii.gz\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unsafe case ID"):
+        read_manifest(manifest)
+
+    manifest.write_text(
+        "case,ct,pet\n"
+        "Patient 01.v2,A_CT.nii.gz,A_PT.nii.gz\n",
+        encoding="utf-8",
+    )
+    assert read_manifest(manifest)[0]["case"] == "Patient 01.v2"
+
+
+def test_manifest_group_cannot_cross_explicit_splits(tmp_path):
+    for name in ("A_CT.nii.gz", "A_PT.nii.gz", "B_CT.nii.gz", "B_PT.nii.gz"):
+        _touch(tmp_path / name)
+    manifest = tmp_path / "dataset.csv"
+    manifest.write_text(
+        "case,ct,pet,group,split\n"
+        "A,A_CT.nii.gz,A_PT.nii.gz,PATIENT-1,train\n"
+        "B,B_CT.nii.gz,B_PT.nii.gz,PATIENT-1,val\n",
+        encoding="utf-8",
+    )
+    cases = read_manifest(manifest)
+
+    with pytest.raises(ValueError, match="group.*PATIENT-1.*multiple splits"):
+        split_cases(cases)
+
+
 def test_legacy_seeded_and_manifest_splits_are_deterministic():
     cases = [{"case": f"CASE{index:02d}", "ct": "x", "pet": "y"} for index in range(10)]
     legacy = split_cases(cases)
@@ -152,6 +210,13 @@ class _Image:
     def __init__(self, shape, affine):
         self.shape = shape
         self.affine = np.asarray(affine)
+
+
+class _ArrayImage(np.ndarray):
+    def __new__(cls, values, affine):
+        result = np.asarray(values).view(cls)
+        result.affine = np.asarray(affine)
+        return result
 
 
 def test_geometry_validator_accepts_aligned_modalities_and_is_non_mutating():
@@ -193,6 +258,83 @@ def test_geometry_validator_rejects_multichannel_inputs():
         })
 
 
+def test_geometry_validator_rejects_empty_and_non_finite_volumes():
+    identity = np.eye(4)
+    with pytest.raises(ValueError, match="positive spatial dimensions"):
+        ValidateGeometryd(("ct", "pet"), "ct")({
+            "case": "EMPTY",
+            "ct": _Image((1, 8, 0, 8), identity),
+            "pet": _Image((1, 8, 0, 8), identity),
+        })
+
+    ct = np.zeros((1, 4, 4, 4), dtype=np.float32)
+    ct[0, 0, 0, 0] = np.nan
+    pet = np.arange(64, dtype=np.float32).reshape(1, 4, 4, 4)
+    with pytest.raises(ValueError, match="NONFINITE.*ct.*non-finite"):
+        ValidateGeometryd(("ct", "pet"), "ct")({
+            "case": "NONFINITE",
+            "ct": _ArrayImage(ct, identity),
+            "pet": _ArrayImage(pet, identity),
+        })
+
+
+def test_geometry_validator_pet_crop_checks_are_explicit():
+    identity = np.eye(4)
+    zeros = np.zeros((1, 6, 6, 6), dtype=np.float32)
+    result = ValidateGeometryd(("ct", "pet"), "ct")({
+        "case": "CONSTANT-DEFAULT",
+        "ct": _ArrayImage(zeros, identity),
+        "pet": _ArrayImage(zeros, identity),
+    })
+    assert result["case"] == "CONSTANT-DEFAULT"
+
+    with pytest.raises(ValueError, match="CONSTANT.*PET is constant"):
+        ValidateGeometryd(("ct", "pet"), "ct", validate_pet_crop=True)({
+            "case": "CONSTANT",
+            "ct": _ArrayImage(zeros, identity),
+            "pet": _ArrayImage(zeros, identity),
+        })
+
+    pet = zeros.copy()
+    pet[:, 1:5, 1:5, 1:5] = 1
+    label = zeros.copy()
+    label[:, 0, 0, 0] = 1
+    result = ValidateGeometryd(("ct", "pet", "label"), "ct")({
+        "case": "CROP-RISK-DEFAULT",
+        "ct": _ArrayImage(zeros, identity),
+        "pet": _ArrayImage(pet, identity),
+        "label": _ArrayImage(label, identity),
+    })
+    assert result["case"] == "CROP-RISK-DEFAULT"
+
+    with pytest.raises(ValueError, match="CROP-RISK.*discard 1 of 1.*label voxels"):
+        ValidateGeometryd(
+            ("ct", "pet", "label"), "ct", validate_pet_crop=True
+        )({
+            "case": "CROP-RISK",
+            "ct": _ArrayImage(zeros, identity),
+            "pet": _ArrayImage(pet, identity),
+            "label": _ArrayImage(label, identity),
+        })
+
+    label.fill(0)
+    label[:, 2, 2, 2] = 1
+    result = ValidateGeometryd(
+        ("ct", "pet", "label"), "ct", validate_pet_crop=True
+    )({
+        "case": "SAFE-CROP",
+        "ct": _ArrayImage(zeros, identity),
+        "pet": _ArrayImage(pet, identity),
+        "label": _ArrayImage(label, identity),
+    })
+    assert result["case"] == "SAFE-CROP"
+
+
 def test_foreground_predicate_is_module_level_and_preserves_array_semantics():
     values = np.array([0, 0, 2])
     assert foreground_above_minimum(values).tolist() == [False, False, True]
+
+    with pytest.raises(ValueError, match="non-finite"):
+        foreground_above_minimum(np.array([0.0, np.nan]))
+    with pytest.raises(ValueError, match="constant"):
+        foreground_above_minimum(np.zeros((2, 2, 2)))

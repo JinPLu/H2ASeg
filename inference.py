@@ -38,11 +38,12 @@ def resolve_device(value: str) -> torch.device:
     return device
 
 
-def _load_checkpoint_file(path: Path, device: torch.device) -> object:
+def _load_checkpoint_file(path: Path) -> object:
+    """Load checkpoint payloads on CPU, independent of the model device."""
     try:
-        return torch.load(path, map_location=device, weights_only=True)
+        return torch.load(path, map_location=torch.device("cpu"), weights_only=True)
     except TypeError:  # PyTorch < 2.0
-        return torch.load(path, map_location=device)
+        return torch.load(path, map_location=torch.device("cpu"))
 
 
 def _extract_state_dict(checkpoint: object) -> Mapping[str, torch.Tensor]:
@@ -112,13 +113,20 @@ def load_checkpoint(
     *,
     checkpoint: object | None = None,
 ) -> None:
-    """Load legacy/full checkpoints and common wrapper-prefixed state dicts."""
+    """Load legacy/full checkpoints and common wrapper-prefixed state dicts.
+
+    Checkpoint payloads stay on CPU; ``load_state_dict`` copies only model
+    parameters to the model's existing device.  ``device`` remains in the
+    public signature for compatibility with existing callers.
+    """
     if checkpoint is None:
-        checkpoint = _load_checkpoint_file(path, device)
+        checkpoint = _load_checkpoint_file(path)
     state = _extract_state_dict(checkpoint)
     prefixes = ("module.", "_model.", "model.")
-    normalized = {}
+    normalized: dict[str, torch.Tensor] = {}
+    origins: dict[str, str] = {}
     for key, value in state.items():
+        original_key = key
         changed = True
         while changed:
             changed = False
@@ -126,7 +134,13 @@ def load_checkpoint(
                 if key.startswith(prefix):
                     key = key[len(prefix):]
                     changed = True
+        if key in normalized:
+            raise ValueError(
+                "Checkpoint parameter keys collide after removing wrapper prefixes: "
+                f"{origins[key]!r} and {original_key!r} both map to {key!r}"
+            )
         normalized[key] = value
+        origins[key] = original_key
     model.load_state_dict(normalized, strict=True)
 
 
@@ -151,11 +165,32 @@ def binary_metrics(label: torch.Tensor, prediction: torch.Tensor) -> dict[str, f
     false_positive_rate, false_negative_rate, iou, dice = metrics_tensor(
         label, prediction
     )
+    # metrics_tensor validates the shared [batch, channel, *spatial] contract
+    # and treats channel 1 as foreground for two-channel one-hot masks.  Use
+    # the same foreground view so all metrics in this result describe the
+    # identical voxels.
+    label_positive = label[:, 1:].bool() if label.shape[1] == 2 else label.bool()
+    prediction_positive = (
+        prediction[:, 1:].bool()
+        if prediction.shape[1] == 2
+        else prediction.bool()
+    )
+    true_positive = int(torch.count_nonzero(label_positive & prediction_positive).item())
+    predicted_positive = int(torch.count_nonzero(prediction_positive).item())
+    actual_positive = int(torch.count_nonzero(label_positive).item())
+    precision = (
+        true_positive / predicted_positive
+        if predicted_positive
+        else float("nan")
+    )
+    recall = true_positive / actual_positive if actual_positive else float("nan")
     return {
         "false_positive_rate": false_positive_rate,
         "false_negative_rate": false_negative_rate,
         "iou": iou,
         "dice": dice,
+        "precision": precision,
+        "recall": recall,
     }
 
 
@@ -178,20 +213,119 @@ def hausdorff95(
 
 
 def save_prediction(prediction: torch.Tensor, reference_path: Path, output_path: Path) -> None:
+    if output_path.resolve(strict=False) == reference_path.resolve(strict=False):
+        raise ValueError(f"Refusing to overwrite source image with prediction: {reference_path}")
     try:
         import nibabel as nib
     except ImportError as exc:
         raise RuntimeError("Saving predictions requires nibabel") from exc
+    if prediction.ndim != 3:
+        raise ValueError(
+            f"Prediction must be exactly 3D before export, got shape {tuple(prediction.shape)}"
+        )
     reference = nib.load(str(reference_path))
+    reference_shape = tuple(int(size) for size in reference.shape)
+    prediction_shape = tuple(int(size) for size in prediction.shape)
+    if len(reference_shape) != 3:
+        raise ValueError(
+            f"Reference image must be exactly 3D, got shape {reference_shape}: {reference_path}"
+        )
+    if prediction_shape != reference_shape:
+        raise ValueError(
+            "Prediction/reference spatial shape mismatch: "
+            f"prediction={prediction_shape}, reference={reference_shape}"
+        )
     header = reference.header.copy()
     header.set_data_dtype(np.uint8)
     image = nib.Nifti1Image(
-        prediction.squeeze().cpu().numpy().astype(np.uint8),
+        prediction.detach().cpu().numpy().astype(np.uint8),
         reference.affine,
         header,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     nib.save(image, str(output_path))
+
+
+def prediction_output_path(
+    prediction_dir: Path,
+    case: str,
+    *,
+    protected_paths: Sequence[Path] = (),
+) -> Path:
+    """Return a contained output path for one manifest case identifier."""
+    if not isinstance(case, str) or not case:
+        raise ValueError("Case identifier must be a non-empty string")
+    if case in {".", ".."} or "/" in case or "\\" in case:
+        raise ValueError(
+            f"Unsafe case identifier {case!r}: path separators and dot segments are not allowed"
+        )
+
+    root = prediction_dir.resolve(strict=False)
+    output = (root / f"{case}.nii.gz").resolve(strict=False)
+    try:
+        output.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsafe case identifier {case!r}: prediction path escapes {root}"
+        ) from exc
+    protected = {path.resolve(strict=False) for path in protected_paths}
+    if output in protected:
+        raise ValueError(f"Refusing to overwrite case source image with prediction: {output}")
+    return output
+
+
+def prepare_prediction_output_paths(
+    records: Sequence[Mapping[str, object]], prediction_dir: Path
+) -> dict[str, Path]:
+    """Resolve every destination and reject collisions with any case input."""
+    protected_paths = {
+        Path(str(record[key])).resolve(strict=False)
+        for record in records
+        for key in ("ct", "pet", "label")
+        if record.get(key)
+    }
+    outputs: dict[str, Path] = {}
+    for record in records:
+        case = record.get("case")
+        if not isinstance(case, str):
+            raise ValueError("Every inference record must have a string case identifier")
+        output = prediction_output_path(prediction_dir, case)
+        if output in protected_paths:
+            raise ValueError(
+                f"Refusing to overwrite case source image with prediction: {output}"
+            )
+        outputs[case] = output
+    return outputs
+
+
+def sliding_window_logits(
+    inputs: torch.Tensor,
+    *,
+    predictor: torch.nn.Module,
+    roi_size: Sequence[int],
+    sw_batch_size: int,
+    overlap: float,
+    compute_device: torch.device,
+) -> torch.Tensor:
+    """Run windows on ``compute_device`` while stitching the full output on CPU."""
+    if inputs.device.type != "cpu":
+        raise ValueError(
+            f"Full-volume sliding-window inputs must stay on CPU, got {inputs.device}"
+        )
+    logits = sliding_window_inference(
+        inputs,
+        roi_size=tuple(roi_size),
+        sw_batch_size=sw_batch_size,
+        predictor=predictor,
+        overlap=overlap,
+        sw_device=compute_device,
+        device=torch.device("cpu"),
+    )
+    if logits.device.type != "cpu":
+        raise RuntimeError(
+            f"Sliding-window output must be stitched on CPU, got {logits.device}"
+        )
+    return logits
 
 
 def build_inference_transform(keys: Sequence[str]) -> Compose:
@@ -254,6 +388,11 @@ def run(args: argparse.Namespace) -> None:
     )
     has_labels = "label" in records[0]
     keys = ["ct", "pet"] + (["label"] if has_labels else [])
+    prediction_paths = (
+        prepare_prediction_output_paths(records, args.prediction_dir)
+        if args.prediction_dir
+        else {}
+    )
     dataset = Dataset(records, build_inference_transform(keys))
     loader = DataLoader(
         dataset,
@@ -263,7 +402,7 @@ def run(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    checkpoint = _load_checkpoint_file(args.checkpoint, device)
+    checkpoint = _load_checkpoint_file(args.checkpoint)
     model_config = resolve_model_config(
         checkpoint,
         roi_size=args.roi_size,
@@ -272,19 +411,21 @@ def run(args: argparse.Namespace) -> None:
     )
     model = H2ASeg(**model_config.to_model_kwargs()).to(device)
     load_checkpoint(model, args.checkpoint, device, checkpoint=checkpoint)
+    del checkpoint
     predictor = InferencePredictor(model).eval()
     rows: list[dict[str, object]] = []
     with torch.inference_mode():
         for batch in loader:
             case = batch["case"][0]
-            ct = batch["ct"].float().to(device, non_blocking=True)
-            pet = batch["pet"].float().to(device, non_blocking=True)
-            logits = sliding_window_inference(
+            ct = batch["ct"].float()
+            pet = batch["pet"].float()
+            logits = sliding_window_logits(
                 torch.cat((ct, pet), dim=1),
+                predictor=predictor,
                 roi_size=model_config.patch_size,
                 sw_batch_size=args.sw_batch_size,
-                predictor=predictor,
                 overlap=args.overlap,
+                compute_device=device,
             )
             prediction = logits.argmax(dim=1, keepdim=True)
             row: dict[str, object] = {
@@ -292,9 +433,9 @@ def run(args: argparse.Namespace) -> None:
                 "prediction_voxels": int(prediction.sum().item()),
             }
             if has_labels:
-                label = (batch["label"].to(device, non_blocking=True) != 0)
+                label = batch["label"] != 0
                 row.update(binary_metrics(label, prediction))
-                affine = batch["ct"].affine.to(device)
+                affine = batch["ct"].affine
                 if affine.ndim == 3:
                     affine = affine[0]
                 spacing = torch.linalg.vector_norm(affine[:3, :3], dim=0).tolist()
@@ -305,7 +446,7 @@ def run(args: argparse.Namespace) -> None:
                 save_prediction(
                     prediction[0, 0],
                     Path(batch["ct"].meta["filename_or_obj"][0]),
-                    args.prediction_dir / f"{case}.nii.gz",
+                    prediction_paths[case],
                 )
             print(f"[{len(rows)}/{len(records)}] {case}")
 

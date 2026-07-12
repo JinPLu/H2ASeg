@@ -149,23 +149,23 @@ class ResUNet(nn.Module):
         return pred1, pred2, pred3, pred4, pred5
     
 if __name__ == "__main__":
-    patch_size = (128, 128, 64)
-    batch_size = 4
-    num_channels = [8, 16, 32, 64, 128]
-    n_classes = 1
+    patch_size = (32, 32, 16)
+    batch_size = 1
+    num_channels = [4, 8, 16, 32, 64]
+    n_classes = 2
     in_channels = 1
 
-    device = torch.device("cuda:6")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = ResUNet(
-                patch_size=patch_size,
                 in_channels=in_channels,
-                n_classes=n_classes+1,
+                n_classes=n_classes,
                 num_channels=num_channels,
-                ).to(device)
+                ).eval().to(device)
     ct = torch.randn((batch_size, 1, *patch_size)).to(device)
     pet = torch.randn((batch_size, 1, *patch_size)).to(device)
 
-    outputs = model(ct, pet)
+    with torch.inference_mode():
+        outputs = model(ct, pet)
     print([output.shape for output in outputs])
    

@@ -1,3 +1,5 @@
+import operator
+
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -212,7 +214,7 @@ class MCSA(nn.Module):
     def __init__(self,
                  in_dim,
                  # input_size,
-                 window_size = [8,8,4],
+                 window_size = (8, 8, 4),
                  dropout = 0.25,
                  channel_scale = 4,
                  activation = nn.PReLU,
@@ -220,15 +222,33 @@ class MCSA(nn.Module):
         super(MCSA, self).__init__()
         self.channel_in = in_dim
         # self.input_size = input_size
-        self.window_size = window_size
+        try:
+            self.window_size = tuple(operator.index(size) for size in window_size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("window_size must contain exactly three positive integers") from exc
+        if len(self.window_size) != 3 or any(size <= 0 for size in self.window_size):
+            raise ValueError("window_size must contain exactly three positive integers")
         self.channel_scale = channel_scale
         self.dropout = dropout
         self.activation = activation
         self.conv_bias = conv_bias
         
-        self.pool_size = int(window_size.min())
-        self.win_merge_ct = nn.Conv3d(self.channel_in, self.channel_in, kernel_size=self.pool_size, stride=self.pool_size)
-        self.win_merge_pet = nn.Conv3d(self.channel_in, self.channel_in, kernel_size=self.pool_size, stride=self.pool_size)
+        self.pool_size = min(self.window_size)
+        # Keep the historical always-on merge bias so checkpoints created with
+        # conv_bias=False retain the same state_dict keys and load strictly.
+        # conv_bias continues to control the attention projections below.
+        self.win_merge_ct = nn.Conv3d(
+            self.channel_in,
+            self.channel_in,
+            kernel_size=self.pool_size,
+            stride=self.pool_size,
+        )
+        self.win_merge_pet = nn.Conv3d(
+            self.channel_in,
+            self.channel_in,
+            kernel_size=self.pool_size,
+            stride=self.pool_size,
+        )
         # self.avg = nn.AvgPool3d(kernel_size=tuple(window_size))
 
         self.inter_window_attention = Bidirectional_Spatial_Attention(in_dim=self.channel_in,
@@ -272,4 +292,3 @@ class MCSA(nn.Module):
         pet_attention = self.IR_pet2(pet_attention2 + pet_attention1)
 
         return ct_attention, pet_attention
-

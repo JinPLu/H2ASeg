@@ -14,8 +14,28 @@ class ResUNet_MCSA_Encoder(ResUNet_Encoder):
                  dropout = 0.3,
                  att_dropout = 0.25,):
         super(ResUNet_MCSA_Encoder, self).__init__(in_channels, num_channels, conv_bias, dropout)
-        self.sa2 = MCSA(num_channels[1], window_size[1], att_dropout)
-        self.sa3 = MCSA(num_channels[2], window_size[2], att_dropout)
+        window_shape = getattr(window_size, "shape", None)
+        if window_shape is not None:
+            window_shape = tuple(window_shape)
+        if window_shape == (3,) or (
+            window_shape is None
+            and len(window_size) == 3
+            and all(not hasattr(size, "__len__") for size in window_size)
+        ):
+            sa2_window_size = window_size
+            sa3_window_size = window_size
+        elif window_shape == (5, 3) or (
+            window_shape is None and len(window_size) == 5
+        ):
+            sa2_window_size = window_size[1]
+            sa3_window_size = window_size[2]
+        else:
+            raise ValueError(
+                "window_size must be a 3-tuple or a five-stage sequence of 3-tuples"
+            )
+
+        self.sa2 = MCSA(num_channels[1], sa2_window_size, att_dropout)
+        self.sa3 = MCSA(num_channels[2], sa3_window_size, att_dropout)
         
         self.sa4 = Bidirectional_Spatial_Attention(num_channels[3], num_channels[3], att_dropout, skip_connection=True)
         self.sa5 = Bidirectional_Spatial_Attention(num_channels[4], num_channels[4], att_dropout, skip_connection=True)
